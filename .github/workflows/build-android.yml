@@ -137,6 +137,38 @@ jobs:
         run: |
           haxelib run lime setup -y
 
+      # The lime.ndll that FunkinCrew/lime ships in git is built against GLIBC
+      # 2.43, but GitHub runners have 2.35/2.39, so it fails to load and Lime
+      # reports "Could not find lime.ndll". We rebuild it for this runner.
+      # (.haxelib is cached, so this only runs when the cache is cold.)
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ make pkg-config \
+            libx11-dev libxi-dev libxext-dev libxinerama-dev libxrandr-dev \
+            libxcursor-dev libxss-dev libxfixes-dev \
+            libgl-dev libgl1-mesa-dev libasound2-dev libpulse-dev \
+            libudev-dev libxkbcommon-dev
+
+      - name: Rebuild lime.ndll for this runner
+        run: |
+          if haxelib run lime config > /dev/null 2>&1; then
+            echo "Lime native library already loads fine."
+            exit 0
+          fi
+          echo "::warning::Prebuilt lime.ndll cannot load here ($(ldd --version | head -n 1)). Rebuilding it."
+          LIME_DIR=.haxelib/lime/git
+          [ -d "$LIME_DIR/project" ] || { echo "::error::$LIME_DIR/project not found"; ls -la .haxelib/lime; exit 1; }
+          git -C "$LIME_DIR" submodule update --init --depth 1 --jobs 4 \
+            || git -C "$LIME_DIR" submodule update --init --jobs 4
+          export HXCPP_COMPILE_THREADS="$(nproc)"
+          # -64: only x86_64 (without it Lime also tries a 32-bit build)
+          haxelib run lime rebuild linux -64
+          ls -la "$LIME_DIR/ndll/Linux64"
+          # Must work now, otherwise fail here instead of 1 hour into the build.
+          haxelib run lime config
+
       - name: Configure Lime for Android
         run: |
           export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/${NDK_VERSION}"
