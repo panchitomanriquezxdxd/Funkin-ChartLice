@@ -1,0 +1,211 @@
+name: Build Android APK (armeabi-v7a + arm64-v8a)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'example_mods/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HAXE_VERSION: 4.3.7
+  # Lime (FunkinCrew fork) only works with this NDK. See docs/COMPILING_MOBILE.md
+  NDK_VERSION: 29.0.13113456
+  BUILD_TOOLS_VERSION: 35.0.0
+  HXCPP_COMPILE_CACHE: ${{ github.workspace }}/.hxcpp_cache
+  HXCPP_CACHE_MB: '4096'
+
+jobs:
+  build-android:
+    name: Build APK (armeabi-v7a + arm64-v8a)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Free disk space
+        run: |
+          # assets (~1.2 GB) + hxcpp objects need room.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      # The assets/art submodules are pinned in the tree to the exact commits
+      # used by the official Funkin v0.8.5 tag. We fetch them ourselves so that
+      # `art` can be downloaded sparsely (the game only needs art/icons).
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Fetch assets (official Funkin.assets, pinned commit)
+        run: |
+          git submodule sync assets
+          git submodule update --init --depth 1 assets
+          echo "assets commit: $(git -C assets rev-parse HEAD)"
+          test -d assets/preload || { echo "::error::assets/preload missing - assets were not downloaded"; exit 1; }
+          echo "assets files: $(find assets -type f -not -path 'assets/.git/*' | wc -l)"
+          du -sh assets
+
+      - name: Fetch art/icons (official Funkin.art, pinned commit, sparse)
+        run: |
+          SHA=$(git ls-tree HEAD art | awk '{print $3}')
+          rm -rf art && mkdir art && cd art
+          git init -q .
+          git remote add origin https://github.com/FunkinCrew/Funkin.art
+          git config core.sparseCheckout true
+          printf 'icons/\nreadme.txt\n' > .git/info/sparse-checkout
+          git fetch --depth 1 --filter=blob:none origin "$SHA"
+          git checkout -q FETCH_HEAD
+          test -d icons/android || { echo "::error::art/icons/android missing"; exit 1; }
+          ls icons | head
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Haxe ${{ env.HAXE_VERSION }}
+        uses: krdlab/setup-haxe@v1
+        with:
+          haxe-version: ${{ env.HAXE_VERSION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages + NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-29" \
+            "platforms;android-35" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}"
+          ls "$ANDROID_HOME/ndk"
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Setup haxelib (Funkin patched haxelib + hmm)
+        run: |
+          mkdir -p "$HOME/haxelib"
+          haxelib setup "$HOME/haxelib"
+          haxelib --global --never install haxelib 4.1.0 || true
+          haxelib --global set haxelib 4.1.0 || true
+          haxelib --global --never git haxelib https://github.com/FunkinCrew/haxelib.git funkin-patches --skip-dependencies
+          haxelib --global --never git hmm https://github.com/FunkinCrew/hmm funkin-patches
+          haxelib --never newrepo
+          haxelib version
+
+      - name: Restore haxelib dependencies cache
+        id: cache-hmm
+        uses: actions/cache@v4
+        with:
+          path: .haxelib
+          key: haxe-hmm-${{ runner.os }}-${{ hashFiles('hmm.json') }}
+
+      - name: Install dependencies (hmm.json)
+        if: steps.cache-hmm.outputs.cache-hit != 'true'
+        run: haxelib --global run hmm install -q
+
+      - name: Restore hxcpp compile cache
+        uses: actions/cache@v4
+        with:
+          path: .hxcpp_cache
+          key: hxcpp-android-${{ runner.os }}-${{ github.sha }}
+          restore-keys: hxcpp-android-${{ runner.os }}-
+
+      - name: Setup Lime
+        run: |
+          haxelib run lime setup -y
+
+      - name: Configure Lime for Android
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          haxelib run lime config ANDROID_SDK "$ANDROID_HOME"
+          haxelib run lime config ANDROID_NDK_ROOT "$ANDROID_NDK_ROOT"
+          haxelib run lime config JAVA_HOME "$JAVA_HOME"
+          haxelib run lime config ANDROID_SETUP true
+          haxelib run lime config
+
+      # Release APKs must be signed to be installable. project.hxp reads the
+      # keystore from ./.env. If you add the secrets below, a stable key is used
+      # (needed to update an installed app); otherwise a throw-away key is made.
+      - name: Prepare signing key (.env)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          KS="$RUNNER_TEMP/chartlice.keystore"
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASS" ] && [ -n "$KEY_ALIAS" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            ALIAS="$KEY_ALIAS"; PASS="$KEYSTORE_PASS"
+            echo "Using keystore from repository secrets."
+          else
+            ALIAS="chartlice"; PASS="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 \
+              -alias "$ALIAS" -storepass "$PASS" -keypass "$PASS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Funkin ChartLice, O=ChartLice, C=CL"
+            echo "Generated a temporary keystore (add ANDROID_KEYSTORE_* secrets for a stable key)."
+          fi
+          echo "::add-mask::$PASS"
+          {
+            echo "KEYSTORE_PATH=$KS"
+            echo "KEYSTORE_ALIAS=$ALIAS"
+            echo "KEYSTORE_PASSWORD=$PASS"
+          } > .env
+
+      - name: Build Android APK (armeabi-v7a + arm64-v8a)
+        # No -DEXCLUDE_ARMV7 -> armv7 is built. -armv7 -arm64 makes the ABI list explicit.
+        # AdMob/IAP need private keys, so they are turned off for this build.
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          haxelib run lime build android -release -armv7 -arm64 \
+            -DNO_FEATURE_MOBILE_ADVERTISEMENTS -DNO_FEATURE_MOBILE_IAP
+        timeout-minutes: 240
+
+      - name: Locate and verify APK (ABIs, assets, signature)
+        id: apk
+        run: |
+          APK=$(find export -type f -name "*.apk" | grep -i release | head -n 1)
+          [ -n "$APK" ] || APK=$(find export -type f -name "*.apk" | head -n 1)
+          [ -n "$APK" ] || { echo "::error::No APK was produced"; find export -maxdepth 6 | head -50; exit 1; }
+          echo "APK: $APK"; ls -lh "$APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+          LIST=$(unzip -l "$APK")
+          for abi in armeabi-v7a arm64-v8a; do
+            n=$(echo "$LIST" | grep -c "lib/$abi/" || true)
+            echo "ABI $abi: $n native libs"
+            [ "$n" -gt 0 ] || { echo "::error::APK is missing the $abi ABI"; exit 1; }
+          done
+
+          n=$(echo "$LIST" | grep -c "assets/assets/" || true)
+          echo "Bundled asset files: $n"
+          [ "$n" -gt 500 ] || { echo "::error::APK has too few assets ($n)"; exit 1; }
+
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner" verify --print-certs "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Funkin-ChartLice-Android-${{ github.sha }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
